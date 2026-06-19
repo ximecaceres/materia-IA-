@@ -170,3 +170,191 @@ except Exception as e:
     print(f"Error al cargar o verificar el archivo '{output_file_path}'. Error: {e}")
 
 print('Re-ejecutando la celda de verificación final.')
+
+"""# AGENTE 2: ENTRENADOR
+
+Objetivo: Aplicar validación, entrenar, seleccionar el modelo y obtener métricas.
+
+
+#### 1. Validación y Limpieza de la Variable Objetivo 'rating'
+
+Se revisó la columna rating para asegurar que solo contenga calificaciones válidas. Los valores incorrectos, vacíos o fuera del rango permitido (0 a 5) fueron eliminados. De esta forma, el modelo se entrena únicamente con datos confiables, mejorando la calidad de las predicciones y de las métricas obtenidas.
+"""
+
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor # Añadido GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error # Añadido MAE
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+print("[Agente 2]: Iniciando fase de entrenamiento y seleccion de modelos...")
+
+# 1. Carga de datos normalizados
+df_cosmetics = pd.read_csv('cosmetics_limpio.csv')
+
+# Correcciones y Validaciones para la variable 'rating'
+print("\n[Agente 2]: Validando y limpiando la variable objetivo 'rating'...")
+
+# Identificar y corregir valores con separador de miles (ej. '14,338') -> '14.338'
+df_cosmetics['rating'] = df_cosmetics['rating'].astype(str).str.replace(',', '.', regex=False)
+
+# Convertir 'rating' a numérico, forzando errores a NaN
+df_cosmetics['rating'] = pd.to_numeric(df_cosmetics['rating'], errors='coerce')
+
+# Contar valores NaN resultantes (de 'no_definido' o errores de conversión)
+nan_ratings_count = df_cosmetics['rating'].isnull().sum()
+if nan_ratings_count > 0:
+    print(f"  - Se detectaron {nan_ratings_count} valores no numéricos o 'no_definido' en 'rating'.")
+    print("    Estos registros serán eliminados para asegurar la calidad de la variable objetivo.")
+    df_cosmetics.dropna(subset=['rating'], inplace=True)
+    print(f"  - Total de filas después de eliminar NaNs en 'rating': {len(df_cosmetics)}")
+
+# Contar valores fuera del rango 0-5
+invalid_range_count = df_cosmetics[(df_cosmetics['rating'] < 0) | (df_cosmetics['rating'] > 5)].shape[0]
+if invalid_range_count > 0:
+    print(f"  - Se detectaron {invalid_range_count} valores en 'rating' fuera del rango [0-5].")
+    print("    Estos registros serán eliminados para asegurar ratings válidos.")
+    df_cosmetics = df_cosmetics[(df_cosmetics['rating'] >= 0) & (df_cosmetics['rating'] <= 5)]
+    print(f"  - Total de filas después de eliminar ratings fuera de rango: {len(df_cosmetics)}")
+
+# 2. Preparacion de caracteristicas (Features) y Target
+# Se añade 'noofratings' como una característica, ya que es altamente relevante para predecir el rating.
+# Se asegura que 'noofratings' sea numérico, rellenando NaNs con 0 (ya que es una característica, no el target).
+# Se corrige el manejo inicial de 'noofratings' que podía haber sido 'no_definido' del Agente 1.
+df_cosmetics['noofratings'] = pd.to_numeric(df_cosmetics['noofratings'], errors='coerce').fillna(0)
+
+X = df_cosmetics[['brand', 'category', 'price', 'noofratings']].copy() # Se añade 'noofratings'
+y = df_cosmetics['rating'].copy()
+
+# Corrección: Codificacion de variables categoricas (One-Hot Encoding) ---
+# Se reemplaza LabelEncoder por OneHotEncoder para 'brand' y 'category'.
+# LabelEncoder asume una relación ordinal, lo cual no es adecuado para variables nominales como 'brand' y 'category'.
+# OneHotEncoder crea nuevas columnas binarias, evitando esta asunción y mejorando el rendimiento del modelo.
+
+categorical_features = ['brand', 'category']
+numerical_features = ['price', 'noofratings'] # Se añade 'noofratings'
+
+# Creamos un preprocesador para aplicar diferentes transformaciones a diferentes columnas
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', 'passthrough', numerical_features), # Para características numéricas, no hacer nada
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features) # One-Hot Encoding para categóricas
+    ])
+
+# 4. Division del dataset (Train / Test Split)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+print(f"Datos segmentados: {X_train.shape[0]} muestras de entrenamiento y {X_test.shape[0]} de prueba.")
+
+# 5. Evaluacion de modelos candidatos mediante Validacion Cruzada
+print("\n[Agente 2]: Evaluando candidatos mediante Cross-Validation...")
+
+# Candidato A: Regresion Lineal con Pipeline de preprocesamiento
+pipeline_lr = Pipeline(steps=[('preprocessor', preprocessor),
+                              ('regressor', LinearRegression())])
+scores_a = cross_val_score(pipeline_lr, X_train, y_train, cv=5, scoring='neg_mean_squared_error')
+rmse_cv_a = np.sqrt(-scores_a.mean())
+mae_cv_a = np.mean(np.abs(cross_val_score(pipeline_lr, X_train, y_train, cv=5, scoring='neg_mean_absolute_error')))
+
+# Candidato B: Random Forest Regressor con Pipeline de preprocesamiento
+pipeline_rf = Pipeline(steps=[('preprocessor', preprocessor),
+                              ('regressor', RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1))]) # n_jobs=-1 para paralelización
+scores_b = cross_val_score(pipeline_rf, X_train, y_train, cv=5, scoring='neg_mean_squared_error')
+rmse_cv_b = np.sqrt(-scores_b.mean())
+mae_cv_b = np.mean(np.abs(cross_val_score(pipeline_rf, X_train, y_train, cv=5, scoring='neg_mean_absolute_error')))
+
+# Candidato C: Gradient Boosting Regressor con Pipeline de preprocesamiento (añadido para mayor robustez)
+pipeline_gb = Pipeline(steps=[('preprocessor', preprocessor),
+                              ('regressor', GradientBoostingRegressor(n_estimators=100, random_state=42))])
+scores_c = cross_val_score(pipeline_gb, X_train, y_train, cv=5, scoring='neg_mean_squared_error')
+rmse_cv_c = np.sqrt(-scores_c.mean())
+mae_cv_c = np.mean(np.abs(cross_val_score(pipeline_gb, X_train, y_train, cv=5, scoring='neg_mean_absolute_error')))
+
+print(f"   -> RMSE Promedio (CV) - Regresion Lineal: {rmse_cv_a:.4f} | MAE Promedio (CV): {mae_cv_a:.4f}")
+print(f"   -> RMSE Promedio (CV) - Random Forest: {rmse_cv_b:.4f} | MAE Promedio (CV): {mae_cv_b:.4f}")
+print(f"   -> RMSE Promedio (CV) - Gradient Boosting: {rmse_cv_c:.4f} | MAE Promedio (CV): {mae_cv_c:.4f}")
+
+# 6. Seleccion automatica del mejor modelo en base al menor error (RMSE)
+model_performances = {
+    "Linear Regression": {"model": pipeline_lr, "rmse": rmse_cv_a, "mae": mae_cv_a},
+    "Random Forest Regressor": {"model": pipeline_rf, "rmse": rmse_cv_b, "mae": mae_cv_b},
+    "Gradient Boosting Regressor": {"model": pipeline_gb, "rmse": rmse_cv_c, "mae": mae_cv_c}
+}
+
+mejor_modelo_info = min(model_performances.items(), key=lambda x: x[1]['rmse'])
+nombre_modelo = mejor_modelo_info[0]
+mejor_modelo = mejor_modelo_info[1]['model']
+
+print(f"\n[Agente 2]: {nombre_modelo} seleccionado como el modelo óptimo debido a menor RMSE en Cross-Validation.")
+
+# Ajuste final del modelo seleccionado con los datos de entrenamiento completos
+mejor_modelo.fit(X_train, y_train)
+
+# 7. Evaluacion final del modelo seleccionado en el conjunto de prueba
+y_pred = mejor_modelo.predict(X_test)
+mse_final = mean_squared_error(y_test, y_pred)
+rmse_final = np.sqrt(mse_final)
+mae_final = mean_absolute_error(y_test, y_pred) # Cálculo del MAE final
+r2_final = r2_score(y_test, y_pred)
+
+print("\nMetricas finales del modelo seleccionado en el conjunto de prueba:")
+print(f"   - Error Cuadratico Medio (MSE): {mse_final:.4f}")
+print(f"   - Raiz del Error Cuadratico Medio (RMSE): {rmse_final:.4f}")
+print(f"   - Error Absoluto Medio (MAE): {mae_final:.4f}") # MAE añadido
+print(f"   - Coeficiente de Determinacion (R2): {r2_final:.4f}")
+
+# Conclusiones automáticas sobre el desempeño del modelo
+print("\n[Agente 2]: Generando conclusiones automáticas...")
+if r2_final < 0.1:
+    conclusion_r2 = "El valor de R² es muy bajo, lo que indica que el modelo explica muy poca de la varianza en la variable objetivo. Es probable que las características actuales sean insuficientes o que la relación no sea lineal. Se recomienda una exploración de características más profunda o modelos más complejos."
+elif r2_final < 0.4:
+    conclusion_r2 = "El valor de R² es bajo, el modelo tiene un poder predictivo limitado. Podría haber variables predictoras importantes que no se están utilizando, o la relación subyacente es más compleja de lo que el modelo actual puede capturar."
+elif r2_final < 0.7:
+    conclusion_r2 = "El valor de R² es moderado, el modelo explica una parte razonable de la varianza. Con mejoras adicionales en características o ajuste de hiperparámetros, el rendimiento podría ser mejor."
+else:
+    conclusion_r2 = "El valor de R² es alto, lo que indica un buen ajuste del modelo a los datos. El modelo tiene un buen poder predictivo."
+
+print(f"Conclusión sobre R²: {conclusion_r2}")
+print(f"El RMSE final de {rmse_final:.2f} y MAE de {mae_final:.2f} indican el error promedio en las predicciones. Un MAE de {mae_final:.2f} significa que, en promedio, las predicciones del modelo se desvían de los valores reales en {mae_final:.2f} unidades de rating.")
+
+# SECCION 5: EXPORTACION DE METRICAS Y MODELO
+
+print("\n[Agente 2]: Exportando artefactos y reporte para el Agente 3...")
+
+# Guardado del modelo y codificadores en archivos binarios
+joblib.dump(mejor_modelo, 'modelo_cosmetics.pkl')
+
+# NOTA: No es necesario guardar los LabelEncoders, ya que se usa OneHotEncoder dentro del Pipeline
+# y el preprocesador se guarda como parte del pipeline_lr o pipeline_rf.
+# joblib.dump(le_brand, 'encoder_brand.pkl')
+# joblib.dump(le_category, 'encoder_category.pkl')
+
+# Generacion del archivo de texto plano con las metricas para el RAG
+reporte_metricas = f"""
+REPORTE DE RENDIMIENTO DEL AGENTE 2 (ENTRENADOR)
+------------------------------------------------
+Modelo seleccionado: {nombre_modelo}
+Métricas de evaluación del modelo:
+- Error Cuadratico Medio (MSE): {mse_final:.4f}
+- Raiz del Error Cuadratico Medio (RMSE): {rmse_final:.4f}
+- Error Absoluto Medio (MAE): {mae_final:.4f}
+- Coeficiente de Determinacion (R2): {r2_final:.4f}
+
+Variables utilizadas para la prediccion: brand, category, price, noofratings
+Variable objetivo predicha: rating
+
+Conclusiones:
+{conclusion_r2}
+El MAE de {mae_final:.2f} significa que, en promedio, las predicciones del modelo se desvían de los valores reales en {mae_final:.2f} unidades de rating.
+"""
+
+with open('metricas_agente2.txt', 'w', encoding='utf-8') as f:
+    f.write(reporte_metricas)
+
+print("[Agente 2]: Fase completada de manera exitosa. Archivo 'modelo_cosmetics.pkl' y 'metricas_agente2.txt' generados.")
+

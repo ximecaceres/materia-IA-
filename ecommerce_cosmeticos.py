@@ -358,3 +358,299 @@ with open('metricas_agente2.txt', 'w', encoding='utf-8') as f:
 
 print("[Agente 2]: Fase completada de manera exitosa. Archivo 'modelo_cosmetics.pkl' y 'metricas_agente2.txt' generados.")
 
+"""AGENTE 3: COMUNICADOR
+
+### Celda 1: Instalaciones e Importaciones Base
+Instalamos las librerías necesarias para el ecosistema LangChain y la ejecución de modelos de Hugging Face en modo optimizado.
+"""
+
+!pip install -q transformers accelerate sentence-transformers faiss-cpu langchain-community
+
+import pandas as pd
+import torch
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    pipeline
+)
+
+from langchain_community.llms import HuggingFacePipeline
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+
+"""CELDA 2: Cargar el modelo Transformer"""
+
+model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype="auto",
+    device_map="auto"
+)
+
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=150,
+    temperature=0.1,
+    do_sample=False,
+    return_full_text=False
+)
+
+llm = HuggingFacePipeline(pipeline=pipe)
+
+print("LLM cargado correctamente.")
+
+"""### Celda 3: Configuración del Agente de Datos
+Cargar dataset
+"""
+
+# Carga del dataset limpio
+df_cosmetics = pd.read_csv('cosmetics_limpio.csv')
+
+# Limpieza de la columna rating
+
+df_cosmetics['rating'] = (
+    df_cosmetics['rating']
+    .astype(str)
+    .str.replace(',', '.', regex=False)
+)
+
+df_cosmetics['rating'] = pd.to_numeric(
+    df_cosmetics['rating'],
+    errors='coerce'
+)
+
+df_cosmetics = df_cosmetics.dropna(
+    subset=['rating']
+)
+
+df_cosmetics = df_cosmetics[
+    (df_cosmetics['rating'] >= 0)
+    &
+    (df_cosmetics['rating'] <= 5)
+]
+
+# Limpieza de noofratings
+
+df_cosmetics['noofratings'] = pd.to_numeric(
+    df_cosmetics['noofratings'],
+    errors='coerce'
+).fillna(0)
+
+print(df_cosmetics.dtypes)
+print("\nDataset cargado correctamente.")
+print(df_cosmetics.head())
+
+"""### Celda 4: Crear el CORPUS"""
+
+documentos = []
+
+for _, fila in df_cosmetics.iterrows():
+
+    texto = f"""
+    Producto: {fila['product_name']}
+    Marca: {fila['brand']}
+    Categoría: {fila['category']}
+    Precio: {fila['price']}
+    Rating: {fila['rating']}
+    Número de ratings: {fila['noofratings']}
+    """
+
+    documentos.append(
+        Document(page_content=texto)
+    )
+
+print("Documentos creados:", len(documentos))
+
+"""### Celda 5: Crear Embeddings"""
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+vectorstore = FAISS.from_documents(
+    documentos,
+    embeddings
+)
+
+retriever = vectorstore.as_retriever(
+    search_kwargs={"k":5}
+)
+
+print("Base vectorial creada.")
+
+"""CELDA 6: Función RAG"""
+
+chat_history = []
+
+def preguntar_agente(pregunta):
+
+    p = pregunta.lower()
+
+    # CONSULTAS ESTADÍSTICAS CON PANDAS
+
+    if "precio promedio" in p:
+
+        respuesta = (
+            f"El precio promedio de los productos es "
+            f"{df_cosmetics['price'].mean():.2f}."
+        )
+
+    elif (
+        "mejores calificaciones" in p
+        or "mejor calificación" in p
+        or "rating promedio" in p
+        or "mejores marcas" in p
+    ):
+
+        top = (
+            df_cosmetics
+            .groupby("brand")["rating"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+
+        respuesta = (
+            "Las marcas con mejores calificaciones promedio son:\n\n"
+            + top.to_string()
+        )
+
+    elif "categorías" in p or "categorias" in p:
+
+        categorias = (
+            df_cosmetics["category"]
+            .dropna()
+            .unique()
+        )
+
+        respuesta = (
+            f"Existen {len(categorias)} categorías:\n\n"
+            + ", ".join(map(str, categorias))
+        )
+
+    elif (
+        "más común" in p
+        or "mas comun" in p
+        or "categoría más común" in p
+        or "categoria mas comun" in p
+    ):
+
+        top = (
+            df_cosmetics["category"]
+            .value_counts()
+            .head(1)
+        )
+
+        respuesta = (
+            f"La categoría más común es "
+            f"{top.index[0]} "
+            f"con {top.iloc[0]} productos."
+        )
+
+    elif (
+        "superior a 4.5" in p
+        or "mayor a 4.5" in p
+    ):
+
+        productos = (
+            df_cosmetics[
+                df_cosmetics["rating"] > 4.5
+            ][["product_name", "brand", "rating"]]
+            .head(10)
+        )
+
+        respuesta = (
+            "Algunos productos con rating superior a 4.5 son:\n\n"
+            + productos.to_string(index=False)
+        )
+
+    # CONSULTAS ABIERTAS CON RAG
+
+    else:
+
+        docs = retriever.invoke(pregunta)
+
+        contexto = "\n".join(
+            [doc.page_content for doc in docs[:2]]
+        )
+
+        prompt = f"""
+Eres un asistente experto en cosméticos.
+
+Utiliza únicamente la información del contexto.
+
+Contexto:
+{contexto}
+
+Pregunta:
+{pregunta}
+
+Responde en español de forma breve y clara.
+"""
+
+        respuesta = llm.invoke(prompt)
+
+    chat_history.append(
+        (pregunta, respuesta)
+    )
+
+    return respuesta
+
+"""CELDA 7: PRUEBAS AUTOMÁTICAS"""
+
+print("----- PRUEBAS AUTOMÁTICAS -----")
+
+preguntas = [
+    "¿Cuál es el precio promedio de los productos?",
+    "¿Qué marcas tienen mejores calificaciones?",
+    "¿Qué categorías de cosméticos existen?",
+    "¿Cuál es la categoría más común en el dataset?",
+    "¿Qué productos tienen rating superior a 4.5?"
+]
+
+for p in preguntas:
+
+    print("\n" + "="*70)
+    print("PREGUNTA:")
+    print(p)
+
+    try:
+        respuesta = preguntar_agente(p)
+
+        print("\nRESPUESTA:")
+        print(respuesta)
+
+    except Exception as e:
+        print("\nERROR:")
+        print(e)
+
+"""CELDA 8: CHAT INTERACTIVO"""
+
+print("\n----- CHAT INTERACTIVO -----")
+print("Escribe 'salir' para finalizar.\n")
+
+while True:
+
+    pregunta = input("Tú: ")
+
+    if pregunta.lower() == "salir":
+        print("Agente: ¡Hasta pronto!")
+        break
+
+    try:
+        respuesta = preguntar_agente(pregunta)
+
+        print("\nAgente:")
+        print(respuesta)
+        print()
+
+    except Exception as e:
+        print("\nError:")
+        print(e)
